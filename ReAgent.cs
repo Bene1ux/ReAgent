@@ -13,6 +13,7 @@ using ExileCore.PoEMemory.Components;
 using ExileCore.Shared.Helpers;
 using ImGuiNET;
 using Newtonsoft.Json;
+using ReAgent.Autocomplete;
 using ReAgent.SideEffects;
 using ReAgent.State;
 using RectangleF = SharpDX.RectangleF;
@@ -38,14 +39,18 @@ public sealed class ReAgent : BaseSettingsPlugin<ReAgentSettings>
 
         var stringData = File.ReadAllText(Path.Join(DirectoryFullName, "CustomAilments.json"));
         CustomAilments = JsonConvert.DeserializeObject<Dictionary<string, List<string>>>(stringData);
-        Settings.DumpState.OnPressed = () => { ImGui.SetClipboardText(JsonConvert.SerializeObject(new RuleState(this, _internalState), new JsonSerializerSettings
+        EnsureEngineWiring();
+        Settings.DumpState.OnPressed = () =>
         {
-            Error = (sender, args) =>
+            ImGui.SetClipboardText(JsonConvert.SerializeObject(new RuleState(this, _internalState), new JsonSerializerSettings
             {
-                DebugWindow.LogError($"Error during state dump {args.ErrorContext.Error}");
-                args.ErrorContext.Handled = true;
-            }
-        })); };
+                Error = (sender, args) =>
+                {
+                    DebugWindow.LogError($"Error during state dump {args.ErrorContext.Error}");
+                    args.ErrorContext.Handled = true;
+                }
+            }));
+        };
         Settings.ImageDirectory.OnValueChanged = () =>
         {
             foreach (var loadedTexture in _loadedTextures)
@@ -60,6 +65,67 @@ public sealed class ReAgent : BaseSettingsPlugin<ReAgentSettings>
 
     private string _profileImportInput = null;
     private Task<(string text, bool edited)> _profileImportObject = null;
+    private bool _engineWired;
+
+    /// <summary>
+    /// Wires the completion engine's data sources and the bridge method. Called from both
+    /// Initialise and DrawSettings: a disabled plugin never runs Initialise, but its rule editor
+    /// (and therefore autocomplete) still works from the settings menu.
+    /// </summary>
+    private void EnsureEngineWiring()
+    {
+        if (_engineWired)
+        {
+            return;
+        }
+
+        _engineWired = true;
+
+        if (CustomAilments == null || CustomAilments.Count == 0)
+        {
+            try
+            {
+                var stringData = File.ReadAllText(Path.Join(DirectoryFullName, "CustomAilments.json"));
+                CustomAilments = JsonConvert.DeserializeObject<Dictionary<string, List<string>>>(stringData);
+            }
+            catch
+            {
+                // Ailment completion just stays empty.
+            }
+        }
+
+        CompletionEngine.CustomAilmentNames = CustomAilments?.Keys.ToList() ?? [];
+        CompletionEngine.GameController = GameController;
+
+        try
+        {
+            GameController.PluginBridge.SaveMethod("ReAgent.GetCompletions",
+                (Func<string, int, int, int, string>)((source, caret, syntaxVersion, actionType) =>
+                {
+                    RuleState state = null;
+                    try
+                    {
+                        state = new RuleState(this, _internalState);
+                    }
+                    catch
+                    {
+                        // Static completions still work without live state.
+                    }
+
+                    var result = CompletionEngine.GetCompletions(source, caret, syntaxVersion, (RuleActionType)actionType, state);
+                    return JsonConvert.SerializeObject(new
+                    {
+                        replaceStart = result.ReplaceStart,
+                        autoShow = result.AutoShow,
+                        items = result.Items.Select(x => new { x.Label, x.Detail }),
+                    });
+                }));
+        }
+        catch
+        {
+            // The bridge is a convenience for external tools; never let it break the plugin.
+        }
+    }
 
     private void DrawProfileImport()
     {
@@ -132,6 +198,8 @@ public sealed class ReAgent : BaseSettingsPlugin<ReAgentSettings>
     {
         base.DrawSettings();
         DrawProfileImport();
+        EnsureEngineWiring();
+        RuleSourceEditor.Enabled = Settings.PluginSettings.EnableRuleAutocomplete;
 
         try
         {
@@ -283,6 +351,8 @@ public sealed class ReAgent : BaseSettingsPlugin<ReAgentSettings>
 
             ImGui.EndTabBar();
         }
+
+        RuleSourceEditor.FlushPopup();
     }
 
     private string GetNewProfileName(string prefix)
@@ -343,8 +413,9 @@ public sealed class ReAgent : BaseSettingsPlugin<ReAgentSettings>
         _internalState.GraphicToDisplay.Clear();
         _internalState.PluginBridgeMethodsToCall.Clear();
         _internalState.ProgressBarsToDisplay.Clear();
+        _internalState.InputElementActive = GameController.IngameState.FocusedInputElement != null;
         _internalState.ChatTitlePanelVisible = GameController.IngameState.IngameUi.ChatTitlePanel.IsVisible;
-        _internalState.CanPressKey = _sinceLastKeyPress.ElapsedMilliseconds >= Settings.GlobalKeyPressCooldown && !_internalState.ChatTitlePanelVisible;
+        _internalState.CanPressKey = _sinceLastKeyPress.ElapsedMilliseconds >= Settings.GlobalKeyPressCooldown && Settings.PluginSettings.UseFocusedInputElement ? !_internalState.InputElementActive : !_internalState.ChatTitlePanelVisible;
         _internalState.LeftPanelVisible = GameController.IngameState.IngameUi.OpenLeftPanel.IsVisible;
         _internalState.RightPanelVisible = GameController.IngameState.IngameUi.OpenRightPanel.IsVisible;
         _internalState.LargePanelVisible = GameController.IngameState.IngameUi.LargePanels.Any(p => p.IsVisible);
@@ -470,12 +541,14 @@ public sealed class ReAgent : BaseSettingsPlugin<ReAgentSettings>
             Graphics.DrawBox(position, position + textSize, Color.Black.ToSharpDx());
             Graphics.DrawText(text, position, ColorFromName(color).ToSharpDx());
         }
-    }
-
+    }     
+   
     private static Color ColorFromName(string color)
     {
+        if (color.StartsWith("#")) return ColorTranslator.FromHtml(color);  // allow hex based colors
         return Color.FromName(color);
     }
+
 
     private void ApplyPendingSideEffects()
     {
@@ -502,7 +575,7 @@ public sealed class ReAgent : BaseSettingsPlugin<ReAgentSettings>
             return false;
         }
 
-        if (!Settings.PluginSettings.EnableInEscapeState && 
+        if (!Settings.PluginSettings.EnableInEscapeState &&
             GameController.Game.IsEscapeState)
         {
             state = "Escape state is active";
